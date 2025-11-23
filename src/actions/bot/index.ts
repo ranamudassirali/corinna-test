@@ -61,14 +61,15 @@ export const onGetCurrentChatBot = async (id: string) => {
   }
 }
 
-let customerEmail: string | undefined
-
 export const onAiChatBotAssistant = async (
   id: string,
   chat: { role: 'assistant' | 'user'; content: string }[],
   author: 'user',
   message: string
 ) => {
+  // MOVED INSIDE FUNCTION FOR THREAD SAFETY
+  let customerEmail: string | undefined
+
   try {
     const chatBotDomain = await client.domain.findUnique({
       where: {
@@ -78,7 +79,7 @@ export const onAiChatBotAssistant = async (
         name: true,
         filterQuestions: {
           where: {
-            answered: null,
+            answered: null, // This ensures we only get unanswered questions
           },
           select: {
             question: true,
@@ -86,6 +87,7 @@ export const onAiChatBotAssistant = async (
         },
       },
     })
+
     if (chatBotDomain) {
       const extractedEmail = extractEmailsFromString(message)
       if (extractedEmail) {
@@ -125,6 +127,8 @@ export const onAiChatBotAssistant = async (
             },
           },
         })
+
+        // --- CASE 1: New Customer Creation ---
         if (checkCustomer && !checkCustomer.customer.length) {
           const newCustomer = await client.domain.update({
             where: {
@@ -155,13 +159,15 @@ export const onAiChatBotAssistant = async (
             return { response }
           }
         }
+
+        // --- CASE 2: Live Chat Mode (Bypass AI) ---
         if (checkCustomer && checkCustomer.customer[0].chatRoom[0].live) {
           await onStoreConversations(
             checkCustomer?.customer[0].chatRoom[0].id!,
             message,
             author
           )
-          
+
           onRealTimeChat(
             checkCustomer.customer[0].chatRoom[0].id,
             message,
@@ -205,33 +211,39 @@ export const onAiChatBotAssistant = async (
           author
         )
 
+        // --- CASE 3: AI Assistant (Existing Customer) ---
         const chatCompletion = await openai.chat.completions.create({
           messages: [
             {
-              role: 'assistant',
+              role: 'system', // CHANGED FROM ASSISTANT TO SYSTEM
               content: `
-              You will get an array of questions that you must ask the customer. 
-              
-              Progress the conversation using those questions. 
-              
-              Whenever you ask a question from the array i need you to add a keyword at the end of the question (complete) this keyword is extremely important. 
-              
-              Do not forget it.
+              ### ROLE
+              You are a sales representative for ${chatBotDomain.name}. You are helpful, polite, and concise.
 
-              only add this keyword when your asking a question from the array of questions. No other question satisfies this condition
+              ### OBJECTIVE
+              Your goal is to gather information from the customer using specific questions, or guide them to book an appointment/make a payment.
 
-              Always maintain character and stay respectfull.
-
-              The array of questions : [${chatBotDomain.filterQuestions
+              ### INSTRUCTIONS
+              1. **Filter Questions**: You have a list of questions to ask: [${chatBotDomain.filterQuestions
                 .map((questions) => questions.question)
-                .join(', ')}]
+                .join(', ')}].
+                 - Ask these questions ONE by ONE.
+                 - When you ask a question from this list, you MUST append the keyword "(complete)" to the end of the sentence.
+                 - Do not ask the same question twice.
 
-              if the customer says something out of context or inapporpriate. Simply say this is beyond you and you will get a real user to continue the conversation. And add a keyword (realtime) at the end.
+              2. **Appointment Logic**: If the user asks to book an appointment or consultation, simply reply with this link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}
 
-              Ask the customer if they would like to book an appointment, if the customer agrees to book an appointment send them this link ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}
+              3. **Payment Logic**: If the user asks to buy a product or make a payment, simply reply with this link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}
 
-              Ask if customer would like to buy a product, if the customer agrees redirect them to the payment page ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}
-          `,
+              4. **Guardrails**:
+                 - If the user asks a question unrelated to ${chatBotDomain.name} (e.g., "Who is the president?", "What is math?"), politely refuse and steer back to the business.
+                 - If the user is angry, rude, or asks a complex technical question you cannot answer, reply ONLY with the keyword "(realtime)".
+                 - Keep responses short (under 3 sentences) unless explaining a product.
+
+              ### IMPORTANT
+              - Only use "(complete)" when asking a filter question.
+              - Only use "(realtime)" when you need a human agent.
+              `,
             },
             ...chat,
             {
@@ -240,8 +252,10 @@ export const onAiChatBotAssistant = async (
             },
           ],
           model: 'gpt-3.5-turbo',
+          temperature: 0.2, // REDUCED TEMP TO PREVENT HALLUCINATION
         })
 
+        // ... (Rest of your logic for handling realtime/complete keywords remains valid)
         if (chatCompletion.choices[0].message.content?.includes('(realtime)')) {
           const realtime = await client.chatRoom.update({
             where: {
@@ -333,43 +347,41 @@ export const onAiChatBotAssistant = async (
           return { response }
         }
       }
+      
+      // --- CASE 4: No Customer (Email Capture Mode) ---
       console.log('No customer')
       const chatCompletion = await openai.chat.completions.create({
-  messages: [
-    {
-      role: 'system', // Use 'system' role for instructions, not 'assistant'
-      content: `
-      ### ROLE
-      You are a helpful, professional sales representative for ${chatBotDomain.name}.
+        messages: [
+          {
+            role: 'system',
+            content: `
+            ### ROLE
+            You are a helpful, professional sales representative for ${chatBotDomain.name}.
 
-      ### GOAL
-      Naturally guide the user to provide their email address.
+            ### GOAL
+            Your SOLE objective is to naturally capture the user's email address.
+            
+            ### INSTRUCTIONS
+            1. Ask the user for their email address to continue the conversation or provide assistance.
+            2. Do NOT answer technical questions or provide detailed support until you have their email.
+            3. If the user refuses, politely insist that you need an email to send them relevant information.
+            4. Keep responses very short (1-2 sentences).
+            5. Do NOT make up facts or features about the company.
 
-      ### CONSTRAINTS
-      1. Keep responses short (max 2 sentences).
-      2. Never break character.
-      3. If the user asks a technical question you don't know, reply with "(realtime)".
-      4. If the user is angry or frustrated, reply with "(realtime)".
-
-      ### SCRIPT
-      You must ask these questions in order. Once asked, do not ask again.
-      Questions: [${chatBotDomain.filterQuestions.map((q) => q.question).join(', ')}]
-
-      ### KEYWORDS
-      - Append "(complete)" ONLY when you have just asked a question from the specific list above.
-      - Append "(realtime)" if a human agent is needed.
-      `,
-    },
-    ...chat,
-    {
-      role: 'user',
-      content: message,
-    },
-  ],
-  model: 'gpt-3.5-turbo', // Consider gpt-4-turbo for better instruction following if budget allows
-  temperature: 0.7, // Lower temperature (e.g., 0.3 - 0.5) for more consistent, faster, less "creative" responses
-  max_tokens: 150, // Hard limit output length to ensure speed
-})
+            ### GUARDRAIL
+            If the user is aggressive or the conversation is failing, reply with "(realtime)".
+            `,
+          },
+          ...chat,
+          {
+            role: 'user',
+            content: message,
+          },
+        ],
+        model: 'gpt-3.5-turbo',
+        temperature: 0.2, // Strict adherence
+        max_tokens: 150,
+      })
 
       if (chatCompletion) {
         const response = {
