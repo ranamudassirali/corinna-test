@@ -99,6 +99,7 @@ export const onAiChatBotAssistant = async (
         }
       }
 
+      // --- EXISTING CUSTOMER FLOW ---
       if (customerEmail) {
         const checkCustomer = await client.domain.findUnique({
           where: {
@@ -211,7 +212,7 @@ export const onAiChatBotAssistant = async (
           author
         )
 
-        // 2. AGGRESSIVE PROMPT LOGIC
+        // 2. AGGRESSIVE PROMPT LOGIC (For Existing Customers)
         const chatCompletion = await openai.chat.completions.create({
           messages: [
             {
@@ -265,7 +266,7 @@ export const onAiChatBotAssistant = async (
             },
           })
           if (realtime) {
-            // Strip the keyword but keep any polite text if it exists (though prompt says don't add any)
+            // Strip the keyword but keep any polite text if it exists
             const cleanContent = chatCompletion.choices[0].message.content.replace(
                 '(realtime)',
                 ''
@@ -354,21 +355,26 @@ export const onAiChatBotAssistant = async (
         }
       }
 
-      // No Customer Logic
-      console.log('No customer')
+      // --- CASE 4: NO CUSTOMER (EMAIL CAPTURE OR GUEST MODE) ---
+      console.log('No customer found')
+      
       const chatCompletion = await openai.chat.completions.create({
         messages: [
           {
             role: 'system',
             content: `
-            You are a sales assistant.
-            Goal: Get the user's email address.
+            You are a helpful assistant for ${chatBotDomain.name}.
             
-            GUARDRAILS:
-            - If the user is aggressive, swears, or says "no" -> Reply with "(realtime)".
-            - If the user asks for a human -> Reply with "(realtime)".
+            ### GOAL
+            Your goal is to identify the user.
+
+            ### INSTRUCTIONS
+            1. Ask for their email address to better assist them.
+            2. **GUEST MODE**: If the user explicitly refuses to give an email, says "no", "skip", "I don't have one", or is aggressive ("fuck you", "just answer me"):
+               -> YOU MUST RESPONSE WITH ONLY THE KEYWORD: "(guest)"
+               -> Do not argue. Do not apologize. Just return "(guest)".
             
-            Otherwise, politely ask for their email address.
+            3. Otherwise, politely ask: "To assist you further, may I have your email address?"
             `,
           },
           ...chat,
@@ -378,20 +384,60 @@ export const onAiChatBotAssistant = async (
           },
         ],
         model: 'gpt-3.5-turbo',
+        temperature: 0.1, 
       })
-      
-      // Handle Realtime in "No Customer" mode as well
-      if (chatCompletion.choices[0].message.content?.includes('(realtime)')) {
-          return {
-             response: {
-                 role: 'assistant',
-                 content: 'I will connect you with a human support agent.'
-             }
-             // Note: You can't toggle 'live' mode easily here because we don't have a customer record yet,
-             // but you can at least stop the bot from arguing.
-          }
+
+      // --- HANDLE GUEST MODE ---
+      if (chatCompletion.choices[0].message.content?.includes('(guest)')) {
+        // 1. Generate a dummy email so the database is happy
+        const guestId = `guest-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+        const guestEmail = `${guestId}@${chatBotDomain.name.replace(/\s+/g, '').toLowerCase() || 'guest'}.com`
+
+        // 2. Create the Customer in DB (Same logic as Case 1)
+        const newCustomer = await client.domain.update({
+            where: { id },
+            data: {
+              customer: {
+                create: {
+                  email: guestEmail,
+                  questions: { create: chatBotDomain.filterQuestions },
+                  chatRoom: { create: {} },
+                },
+              },
+            },
+          })
+
+        if (newCustomer) {
+           // 3. We must "Fake" a bot response containing the email 
+           // so that on the NEXT turn, your 'historyEmail' scanner finds this user again.
+           const responseContent = `I've started an anonymous session for you. How can I help? (ID: ${guestEmail})`
+
+           // Store the conversation so it persists
+           // Note: We need to fetch the new ChatRoom ID to store this
+           const guestChatRoom = await client.domain.findUnique({
+              where: { id },
+              select: {
+                customer: {
+                    where: { email: guestEmail },
+                    select: { chatRoom: { select: { id: true } } }
+                }
+              }
+           })
+           
+           if (guestChatRoom?.customer[0]?.chatRoom[0]?.id) {
+               await onStoreConversations(
+                 guestChatRoom.customer[0].chatRoom[0].id,
+                 responseContent,
+                 'assistant'
+               )
+           }
+
+           // Return the response to the frontend (hide the ID if you want, but keeping it helps debugging)
+           return { response: { role: 'assistant', content: "Okay, I've created an anonymous guest session for you. How can I help?" } }
+        }
       }
 
+      // --- NORMAL EMAIL REQUEST RESPONSE ---
       if (chatCompletion) {
         const response = {
           role: 'assistant',
