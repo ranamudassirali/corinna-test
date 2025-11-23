@@ -88,13 +88,11 @@ export const onAiChatBotAssistant = async (
     })
 
     if (chatBotDomain) {
-      // 1. IMPROVED EMAIL DISCOVERY
-      // First, check the current message
+      // 1. EMAIL DISCOVERY (Scan current message + History)
       const currentEmail = extractEmailsFromString(message)
       if (currentEmail) {
         customerEmail = currentEmail[0]
       } else {
-        // If not in current message, SCAN HISTORY to remember who this is
         const historyEmail = chat.find((c) => extractEmailsFromString(c.content))
         if (historyEmail) {
           customerEmail = extractEmailsFromString(historyEmail.content)![0]
@@ -213,7 +211,7 @@ export const onAiChatBotAssistant = async (
           author
         )
 
-        // 2. IMPROVED PROMPT LOGIC
+        // 2. AGGRESSIVE PROMPT LOGIC
         const chatCompletion = await openai.chat.completions.create({
           messages: [
             {
@@ -221,28 +219,29 @@ export const onAiChatBotAssistant = async (
               content: `
               You are a sales representative for ${chatBotDomain.name}.
               
-              ### PRIORITY INSTRUCTIONS
-              1. **LINKS FIRST**: If the user asks to book an appointment, schedule a meeting, or buy a product, YOU MUST PROVIDE THE LINK IMMEDIATELY.
-                 - Do NOT ask for "date", "time", or "purpose".
-                 - Do NOT ask for their email again.
-                 - Simply say "Here is the link:" and provide the URL.
+              ### CRITICAL RULES (READ FIRST)
+              Check the user's message for these conditions BEFORE answering:
 
-              2. **LINKS**:
-                 - Appointment Link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}
-                 - Payment Link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}
+              1. **HANDOFF / AGGRESSION**: 
+                 - If the user uses profanity (e.g., "fuck", "shit", "stupid").
+                 - If the user is hostile or aggressive.
+                 - If the user says "I don't want to talk to you", "stop", "no bot", or asks for a "human" or "agent".
+                 -> YOU MUST RESPONSE WITH ONLY: "(realtime)"
+                 -> Do not apologize. Do not say goodbye. Just return the keyword.
 
-              3. **FILTER QUESTIONS**:
-                 - If the user is NOT asking for a link, ask these questions one by one: [${chatBotDomain.filterQuestions
+              2. **LINKS (High Priority)**: 
+                 - If the user asks to book/schedule/meet -> Reply: "Here is the appointment link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}"
+                 - If the user asks to buy/purchase/pay -> Reply: "Here is the payment link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}"
+                 - Do NOT ask more questions if they want a link.
+
+              3. **SALES CONVERSATION**:
+                 - If rules 1 and 2 don't apply, ask these questions one by one: [${chatBotDomain.filterQuestions
                    .map((questions) => questions.question)
                    .join(', ')}].
                  - When asking a filter question, end the sentence with "(complete)".
 
-              4. **REALTIME**:
-                 - If the user is angry or asks a complex technical question, reply with "(realtime)".
-
-              5. **BEHAVIOR**:
-                 - Keep responses concise.
-                 - Never ask for information if the user is asking for a link.
+              4. **UNKNOWN**:
+                 - If the user asks a technical question you don't know, reply: "(realtime)"
               `,
             },
             ...chat,
@@ -252,7 +251,7 @@ export const onAiChatBotAssistant = async (
             },
           ],
           model: 'gpt-3.5-turbo',
-          temperature: 0, // Set to 0 for maximum strictness
+          temperature: 0, // Zero temperature prevents "polite" deviations
         })
 
         // Handling (realtime)
@@ -266,13 +265,20 @@ export const onAiChatBotAssistant = async (
             },
           })
           if (realtime) {
-            const response = {
-              role: 'assistant',
-              content: chatCompletion.choices[0].message.content.replace(
+            // Strip the keyword but keep any polite text if it exists (though prompt says don't add any)
+            const cleanContent = chatCompletion.choices[0].message.content.replace(
                 '(realtime)',
                 ''
-              ),
+              ).trim()
+            
+            // If the bot returned ONLY "(realtime)", we can inject a default system message
+            const finalContent = cleanContent || "I will connect you with a human agent now."
+
+            const response = {
+              role: 'assistant',
+              content: finalContent,
             }
+
             await onStoreConversations(
               checkCustomer?.customer[0].chatRoom[0].id!,
               response.content,
@@ -348,18 +354,21 @@ export const onAiChatBotAssistant = async (
         }
       }
 
-      // No Customer Logic (Only reached if email is NEVER found in history)
+      // No Customer Logic
       console.log('No customer')
       const chatCompletion = await openai.chat.completions.create({
         messages: [
           {
             role: 'system',
             content: `
-            You are a helpful assistant.
-            The user is trying to talk to us. 
-            Your ONLY goal is to get their email address.
-            Do not answer any questions until you have the email address.
-            Simply ask: "To assist you, may I have your email address?"
+            You are a sales assistant.
+            Goal: Get the user's email address.
+            
+            GUARDRAILS:
+            - If the user is aggressive, swears, or says "no" -> Reply with "(realtime)".
+            - If the user asks for a human -> Reply with "(realtime)".
+            
+            Otherwise, politely ask for their email address.
             `,
           },
           ...chat,
@@ -370,6 +379,18 @@ export const onAiChatBotAssistant = async (
         ],
         model: 'gpt-3.5-turbo',
       })
+      
+      // Handle Realtime in "No Customer" mode as well
+      if (chatCompletion.choices[0].message.content?.includes('(realtime)')) {
+          return {
+             response: {
+                 role: 'assistant',
+                 content: 'I will connect you with a human support agent.'
+             }
+             // Note: You can't toggle 'live' mode easily here because we don't have a customer record yet,
+             // but you can at least stop the bot from arguing.
+          }
+      }
 
       if (chatCompletion) {
         const response = {
