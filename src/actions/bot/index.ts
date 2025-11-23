@@ -67,7 +67,6 @@ export const onAiChatBotAssistant = async (
   author: 'user',
   message: string
 ) => {
-  // MOVED INSIDE FUNCTION FOR THREAD SAFETY
   let customerEmail: string | undefined
 
   try {
@@ -79,7 +78,7 @@ export const onAiChatBotAssistant = async (
         name: true,
         filterQuestions: {
           where: {
-            answered: null, // This ensures we only get unanswered questions
+            answered: null,
           },
           select: {
             question: true,
@@ -89,9 +88,17 @@ export const onAiChatBotAssistant = async (
     })
 
     if (chatBotDomain) {
-      const extractedEmail = extractEmailsFromString(message)
-      if (extractedEmail) {
-        customerEmail = extractedEmail[0]
+      // 1. IMPROVED EMAIL DISCOVERY
+      // First, check the current message
+      const currentEmail = extractEmailsFromString(message)
+      if (currentEmail) {
+        customerEmail = currentEmail[0]
+      } else {
+        // If not in current message, SCAN HISTORY to remember who this is
+        const historyEmail = chat.find((c) => extractEmailsFromString(c.content))
+        if (historyEmail) {
+          customerEmail = extractEmailsFromString(historyEmail.content)![0]
+        }
       }
 
       if (customerEmail) {
@@ -128,7 +135,7 @@ export const onAiChatBotAssistant = async (
           },
         })
 
-        // --- CASE 1: New Customer Creation ---
+        // New Customer Logic
         if (checkCustomer && !checkCustomer.customer.length) {
           const newCustomer = await client.domain.update({
             where: {
@@ -149,7 +156,6 @@ export const onAiChatBotAssistant = async (
             },
           })
           if (newCustomer) {
-            console.log('new customer made')
             const response = {
               role: 'assistant',
               content: `Welcome aboard ${
@@ -160,14 +166,14 @@ export const onAiChatBotAssistant = async (
           }
         }
 
-        // --- CASE 2: Live Chat Mode (Bypass AI) ---
+        // Live Chat Logic
         if (checkCustomer && checkCustomer.customer[0].chatRoom[0].live) {
           await onStoreConversations(
             checkCustomer?.customer[0].chatRoom[0].id!,
             message,
             author
           )
-
+          
           onRealTimeChat(
             checkCustomer.customer[0].chatRoom[0].id,
             message,
@@ -179,10 +185,7 @@ export const onAiChatBotAssistant = async (
             const user = await clerkClient.users.getUser(
               checkCustomer.User?.clerkId!
             )
-
             onMailer(user.emailAddresses[0].emailAddress)
-
-            //update mail status to prevent spamming
             const mailed = await client.chatRoom.update({
               where: {
                 id: checkCustomer.customer[0].chatRoom[0].id,
@@ -191,7 +194,6 @@ export const onAiChatBotAssistant = async (
                 mailed: true,
               },
             })
-
             if (mailed) {
               return {
                 live: true,
@@ -211,38 +213,36 @@ export const onAiChatBotAssistant = async (
           author
         )
 
-        // --- CASE 3: AI Assistant (Existing Customer) ---
+        // 2. IMPROVED PROMPT LOGIC
         const chatCompletion = await openai.chat.completions.create({
           messages: [
             {
-              role: 'system', // CHANGED FROM ASSISTANT TO SYSTEM
+              role: 'system',
               content: `
-              ### ROLE
-              You are a sales representative for ${chatBotDomain.name}. You are helpful, polite, and concise.
+              You are a sales representative for ${chatBotDomain.name}.
+              
+              ### PRIORITY INSTRUCTIONS
+              1. **LINKS FIRST**: If the user asks to book an appointment, schedule a meeting, or buy a product, YOU MUST PROVIDE THE LINK IMMEDIATELY.
+                 - Do NOT ask for "date", "time", or "purpose".
+                 - Do NOT ask for their email again.
+                 - Simply say "Here is the link:" and provide the URL.
 
-              ### OBJECTIVE
-              Your goal is to gather information from the customer using specific questions, or guide them to book an appointment/make a payment.
+              2. **LINKS**:
+                 - Appointment Link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}
+                 - Payment Link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}
 
-              ### INSTRUCTIONS
-              1. **Filter Questions**: You have a list of questions to ask: [${chatBotDomain.filterQuestions
-                .map((questions) => questions.question)
-                .join(', ')}].
-                 - Ask these questions ONE by ONE.
-                 - When you ask a question from this list, you MUST append the keyword "(complete)" to the end of the sentence.
-                 - Do not ask the same question twice.
+              3. **FILTER QUESTIONS**:
+                 - If the user is NOT asking for a link, ask these questions one by one: [${chatBotDomain.filterQuestions
+                   .map((questions) => questions.question)
+                   .join(', ')}].
+                 - When asking a filter question, end the sentence with "(complete)".
 
-              2. **Appointment Logic**: If the user asks to book an appointment or consultation, simply reply with this link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/appointment/${checkCustomer?.customer[0].id}
+              4. **REALTIME**:
+                 - If the user is angry or asks a complex technical question, reply with "(realtime)".
 
-              3. **Payment Logic**: If the user asks to buy a product or make a payment, simply reply with this link: ${process.env.NEXT_PUBLIC_DOMAIN}/portal/${id}/payment/${checkCustomer?.customer[0].id}
-
-              4. **Guardrails**:
-                 - If the user asks a question unrelated to ${chatBotDomain.name} (e.g., "Who is the president?", "What is math?"), politely refuse and steer back to the business.
-                 - If the user is angry, rude, or asks a complex technical question you cannot answer, reply ONLY with the keyword "(realtime)".
-                 - Keep responses short (under 3 sentences) unless explaining a product.
-
-              ### IMPORTANT
-              - Only use "(complete)" when asking a filter question.
-              - Only use "(realtime)" when you need a human agent.
+              5. **BEHAVIOR**:
+                 - Keep responses concise.
+                 - Never ask for information if the user is asking for a link.
               `,
             },
             ...chat,
@@ -252,10 +252,10 @@ export const onAiChatBotAssistant = async (
             },
           ],
           model: 'gpt-3.5-turbo',
-          temperature: 0.2, // REDUCED TEMP TO PREVENT HALLUCINATION
+          temperature: 0, // Set to 0 for maximum strictness
         })
 
-        // ... (Rest of your logic for handling realtime/complete keywords remains valid)
+        // Handling (realtime)
         if (chatCompletion.choices[0].message.content?.includes('(realtime)')) {
           const realtime = await client.chatRoom.update({
             where: {
@@ -265,7 +265,6 @@ export const onAiChatBotAssistant = async (
               live: true,
             },
           })
-
           if (realtime) {
             const response = {
               role: 'assistant',
@@ -274,16 +273,16 @@ export const onAiChatBotAssistant = async (
                 ''
               ),
             }
-
             await onStoreConversations(
               checkCustomer?.customer[0].chatRoom[0].id!,
               response.content,
               'assistant'
             )
-
             return { response }
           }
         }
+
+        // Handling (complete) for filter questions
         if (chat[chat.length - 1].content.includes('(complete)')) {
           const firstUnansweredQuestion =
             await client.customerResponses.findFirst({
@@ -310,6 +309,7 @@ export const onAiChatBotAssistant = async (
           }
         }
 
+        // Handling Link Extraction
         if (chatCompletion) {
           const generatedLink = extractURLfromString(
             chatCompletion.choices[0].message.content as string
@@ -320,7 +320,7 @@ export const onAiChatBotAssistant = async (
             const sanitizedLink = link.replace(/[)\]\.,]+$/, '')
             const response = {
               role: 'assistant',
-              content: `Great! you can follow the link to proceed`,
+              content: `Great! You can follow the link to proceed:`,
               link: sanitizedLink,
             }
 
@@ -347,29 +347,19 @@ export const onAiChatBotAssistant = async (
           return { response }
         }
       }
-      
-      // --- CASE 4: No Customer (Email Capture Mode) ---
+
+      // No Customer Logic (Only reached if email is NEVER found in history)
       console.log('No customer')
       const chatCompletion = await openai.chat.completions.create({
         messages: [
           {
             role: 'system',
             content: `
-            ### ROLE
-            You are a helpful, professional sales representative for ${chatBotDomain.name}.
-
-            ### GOAL
-            Your SOLE objective is to naturally capture the user's email address.
-            
-            ### INSTRUCTIONS
-            1. Ask the user for their email address to continue the conversation or provide assistance.
-            2. Do NOT answer technical questions or provide detailed support until you have their email.
-            3. If the user refuses, politely insist that you need an email to send them relevant information.
-            4. Keep responses very short (1-2 sentences).
-            5. Do NOT make up facts or features about the company.
-
-            ### GUARDRAIL
-            If the user is aggressive or the conversation is failing, reply with "(realtime)".
+            You are a helpful assistant.
+            The user is trying to talk to us. 
+            Your ONLY goal is to get their email address.
+            Do not answer any questions until you have the email address.
+            Simply ask: "To assist you, may I have your email address?"
             `,
           },
           ...chat,
@@ -379,8 +369,6 @@ export const onAiChatBotAssistant = async (
           },
         ],
         model: 'gpt-3.5-turbo',
-        temperature: 0.2, // Strict adherence
-        max_tokens: 150,
       })
 
       if (chatCompletion) {
@@ -388,7 +376,6 @@ export const onAiChatBotAssistant = async (
           role: 'assistant',
           content: chatCompletion.choices[0].message.content,
         }
-
         return { response }
       }
     }
